@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# gj — GitJournal CLI
+# Universal task tracking and journaling for AI-assisted development.
+
+set -uo pipefail
+
+GJ_CONFIG_DIR="${GJ_CONFIG_DIR:-$HOME/.config/gitjournal}"
+GJ_PROJECTS_DIR="$GJ_CONFIG_DIR/projects"
+
+# Output helpers
+if [ -t 1 ]; then
+    BOLD=$'\033[1m'; RED=$'\033[31m'; GRN=$'\033[32m'; BLU=$'\033[34m'; RST=$'\033[0m'
+else
+    BOLD=""; RED=""; GRN=""; BLU=""; RST=""
+fi
+
+info() { printf '%s→%s %s\n' "$BLU" "$RST" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '%s⚠%s %s\n' "$YLW" "$RST" "$*" >&2; }
+err()  { printf '%s✗%s %s\n' "$RED" "$RST" "$*" >&2; }
+die()  { err "$@"; exit 1; }
+
+ensure_dirs() {
+    mkdir -p "$GJ_PROJECTS_DIR"
+}
+
+# Resolve project root and create a stable ID for config
+get_repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+get_repo_id() {
+    local root=$(get_repo_root)
+    echo "$root" | md5sum | cut -d' ' -f1
+}
+
+get_config_path() {
+    echo "$GJ_PROJECTS_DIR/$(get_repo_id).conf"
+}
+
+load_state() {
+    local conf=$(get_config_path)
+    # Default values
+    ACTIVE_ISSUE_URL=""
+    ACTIVE_TASK_TITLE=""
+    BOARD_SYSTEM="auto"
+    AI_ATTR="yes"
+    AGENT_NAME="AI" # Should be overridden by environment
+    
+    if [ -f "$conf" ]; then
+        # shellcheck disable=SC1090
+        . "$conf"
+    fi
+}
+
+save_state() {
+    ensure_dirs
+    cat > "$(get_config_path)" <<EOF
+ACTIVE_ISSUE_URL="$ACTIVE_ISSUE_URL"
+ACTIVE_TASK_TITLE="$ACTIVE_TASK_TITLE"
+BOARD_SYSTEM="$BOARD_SYSTEM"
+AI_ATTR="$AI_ATTR"
+EOF
+}
+
+cmd_init() {
+    ensure_dirs
+    local root=$(get_repo_root)
+    [ -f "$root/JOURNAL.md" ] && warn "Journal already exists in $root. Re-initializing config."
+
+    # Initial state
+    BOARD_SYSTEM="github"
+    AI_ATTR="yes"
+    ACTIVE_ISSUE_URL=""
+    ACTIVE_TASK_TITLE=""
+    save_state
+
+    if [ ! -f "$root/JOURNAL.md" ]; then
+        cat > "$root/JOURNAL.md" <<EOF
+# Work Journal
+This file tracks tasks, technical reasoning, and findings.
+EOF
+        ok "Initialized journal in $root/JOURNAL.md"
+    fi
+    ok "Configured state in $(get_config_path)"
+}
+
+cmd_open() {
+    local title="${1:-}"
+    [ -z "$title" ] && die "Usage: gj open <title>"
+    load_state
+    local root=$(get_repo_root)
+    [ -f "$root/JOURNAL.md" ] || die "No journal found. Run 'gj init' first."
+
+    info "Opening task: $title"
+    
+    local issue_url=""
+    if [ "$BOARD_SYSTEM" = "github" ] && command -v gh >/dev/null 2>&1; then
+        issue_url=$(gh issue create --title "$title" --body "Task initiated via GitJournal." --label "automated-journal" 2>/dev/null)
+    fi
+    
+    ACTIVE_ISSUE_URL="$issue_url"
+    ACTIVE_TASK_TITLE="$title"
+    save_state
+
+    {
+        echo ""
+        echo "## [$(date +'%Y-%m-%d %H:%M')] TASK: $title"
+        [ -n "$issue_url" ] && echo "Issue: $issue_url"
+        echo "---"
+    } >> "$root/JOURNAL.md"
+    
+    [ -n "$issue_url" ] && ok "Opened GitHub issue: $issue_url" || ok "Started local journal entry."
+}
+
+cmd_note() {
+    local msg="${1:-}"
+    [ -z "$msg" ] && die "Usage: gj note <message>"
+    load_state
+    local root=$(get_repo_root)
+    
+    local attr=""
+    if [ "$AI_ATTR" = "yes" ]; then
+        attr=" [${GJ_AGENT_NAME:-AI}-Assisted]"
+    fi
+    
+    info "Adding note..."
+    echo "- **Note$attr**: $msg" >> "$root/JOURNAL.md"
+    
+    if [ -n "$ACTIVE_ISSUE_URL" ]; then
+        if [[ "$ACTIVE_ISSUE_URL" == *"github.com"* ]] && command -v gh >/dev/null 2>&1; then
+            gh issue comment "$ACTIVE_ISSUE_URL" --body "$msg$attr" >/dev/null 2>&1
+        fi
+    fi
+}
+
+cmd_close() {
+    local summary="${1:-}"
+    load_state
+    local root=$(get_repo_root)
+    
+    info "Closing task: $ACTIVE_TASK_TITLE"
+    echo "- **CLOSED**: $summary" >> "$root/JOURNAL.md"
+    
+    if [ -n "$ACTIVE_ISSUE_URL" ]; then
+        if [[ "$ACTIVE_ISSUE_URL" == *"github.com"* ]] && command -v gh >/dev/null 2>&1; then
+            gh issue comment "$ACTIVE_ISSUE_URL" --body "Task closed: $summary" >/dev/null 2>&1
+            gh issue close "$ACTIVE_ISSUE_URL" >/dev/null 2>&1
+        fi
+        ok "Closed issue $ACTIVE_ISSUE_URL"
+    fi
+    
+    ACTIVE_ISSUE_URL=""
+    ACTIVE_TASK_TITLE=""
+    save_state
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init) cmd_init "$@" ;;
+        open) cmd_open "$@" ;;
+        note) cmd_note "$@" ;;
+        close) cmd_close "$@" ;;
+        *) echo "Usage: gj {init|open|note|close|commit}"; exit 1 ;;
+    esac
+}
+
+main "$@"
